@@ -1,5 +1,5 @@
 """
-Copyright (c) 2024 by SageAttention team.
+Copyright (c) 2024 by SageAttention team. Modifications Copyright (c) 2025-2026 DeepBeepMeep (SageGP).
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -275,15 +275,16 @@ if not SKIP_CUDA_BUILD:
     cmdclass = {"build_ext": BuildExtensionSeparateDir} if ext_modules else {}
 
 setup(
-    name='sageattention',
-    version='2.2.0',
-    author='SageAttention team',
+    name='sagegp',
+    version='1.0.0',
+    author='DeepBeepMeep (SageGP), SageAttention team (SageAttention 2)',
     license='Apache 2.0 License',
-    description='Accurate and efficient plug-and-play low-bit attention.',
+    description='SageAttention 2 for every GPU, with faster precise, adaptive and fast (FP4) attention on GeForce Blackwell.',
     long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/thu-ml/SageAttention',
-    packages=find_packages(),
+    url='https://github.com/deepbeepmeep/SageGP',
+    packages=find_packages(include=['sageattention', 'sageattention.*', 'sagegp', 'sagegp.*']),
+    package_data={'sagegp.sm120': ['cubins/*.cubin', 'cubins/*/*.cubin']},
     python_requires='>=3.9',
     ext_modules=ext_modules,
     cmdclass=cmdclass,
