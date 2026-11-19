@@ -9,8 +9,9 @@ Poor. WanGP shows the full integration: kernels fused with the q / k norms and r
 split by groups of heads to lower peak VRAM, CUDA graphs, and the first denoising step in Precise. If you want these kernels at work
 without writing any code, [try WanGP](https://github.com/deepbeepmeep/Wan2GP).
 
-> This repository is a fork of [SageAttention](https://github.com/thu-ml/SageAttention). Its original README, with the papers and their
-> citations, is [README_SageAttention.md](README_SageAttention.md).
+> This repository is a fork of [SageAttention](https://github.com/thu-ml/SageAttention), including the Windows and stable-ABI work of
+> [woct0rdho's SageAttention](https://github.com/woct0rdho/SageAttention). The original README, with the papers and their citations, is
+> [README_SageAttention.md](README_SageAttention.md).
 
 ## Attention modes
 
@@ -41,8 +42,14 @@ uninstall `sageattention` first.
 
 ```
 pip uninstall -y sageattention
-pip install <wheel of the Releases page matching your Python, PyTorch and CUDA>
+# Windows
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
+# Linux (glibc 2.28 or newer)
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
 ```
+
+The wheels work with any Python from 3.10 and PyTorch 2.10 or newer built for CUDA 13 (PyTorch's stable ABI), on GPUs from the RTX 30
+series (Ampere: 8.0, 8.6; Ada: 8.9; Hopper: 9.0; Blackwell: 10.0, 12.0, 12.1).
 
 To build from source (CUDA toolkit 12.8 or newer, PyTorch installed):
 

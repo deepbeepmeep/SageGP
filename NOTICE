@@ -5,8 +5,10 @@ This product includes SageAttention (https://github.com/thu-ml/SageAttention),
 Copyright (c) 2024 by SageAttention team, licensed under the Apache License, Version 2.0.
 Its original README is kept in README_SageAttention.md.
 
-Modifications to SageAttention: CUDA kernels launched on PyTorch's current stream, the sm90 extension built for sm_90a only,
-64-bit offsets in the Triton kernels (SageAttention pull request #387).
+It includes the Windows build, the PyTorch stable-ABI port and the device guard / current stream changes of
+woct0rdho's SageAttention (https://github.com/woct0rdho/SageAttention, release v2.2.0-windows.post6), Apache License 2.0.
+
+Further modifications: 64-bit offsets in the Triton kernels (SageAttention pull request #387).
 
 The GeForce Blackwell kernels (sagegp/sm120, csrc/sm120) are built from SageAttention 2.2's CUDA headers, read from this
 repository's history and modified at build time by the scripts of csrc/sm120.
