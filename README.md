@@ -104,17 +104,80 @@ sagegp.hooks.notice = lambda operation: print("kernel:", operation)   # optional
 
 ## How it works
 
-- **Precise** quantizes Q and K to INT8 per 32 and 64 rows (K centred on its mean) and V to FP8 per channel, as SageAttention 2 does. Its
-  kernel computes the P.V products one 16-channel value fragment at a time, so that each FP16 accumulator lives for 8 products instead
-  of 64 and the V fragments are read ahead, and staggers the two blocks of a multiprocessor so that their tensor-core phases interleave.
-- **Adaptive** ranks the channels of each head on sample rows and tests, on pilot queries, which score widths (32, 64 or 128 INT8 channels,
-  or 64 INT8 + 64 NVFP4) and value widths keep the attention output within a budget; all the decisions stay on the GPU.
-- **Fast** rotates Q and the centred K by a signed Hadamard matrix (exact in Q.K), then rounds each 16-channel block to NVFP4 and spreads
-  its rounding error over the later channels of the row through the matrix that minimizes the score error in the partner's
-  second-moment metric (GPTQ-style feedback). The spread matrices come from matrix products only (Newton-Schulz), so a call can be
-  recorded in a CUDA graph.
+All the RTX 50xx kernels share one CUDA kernel family, built from SageAttention 2.2's SM89 attention template (`csrc/sm120`): INT8 /
+NVFP4 Q.K on the tensor cores, an FP32 online softmax, FP8 (E4M3) P.V with SageAttention's two-level accumulation, per-channel value
+scales applied in the epilogue. They are compiled once for `sm_120a` and shipped as cubins that PyTorch loads at run time, so installing
+SageGP needs no compiler. The packing kernels around them are Triton kernels (`sagegp/sm120`). Every launch runs on PyTorch's current
+stream and every decision (which head takes which format) stays on the GPU, with no synchronization with the host, so whole models
+can be recorded in CUDA graphs.
 
-## License
+### Precise: SageAttention 2 arithmetic in a faster schedule
 
-Apache License 2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). SageGP is based on SageAttention by the SageAttention team; please
-cite their papers ([README_SageAttention.md](README_SageAttention.md)) when you use it in research.
+- **Same quantization as SageAttention 2**: Q to INT8 per 32 rows, K centred on its mean and quantized per 64 rows, V to FP8 per channel.
+  The error stays at SageAttention 2's (1.09 % against 1.07 % on Wan 2.2 inputs, 1.77 % against 1.76 % on MiniMax H3).
+- **Dense kernel**: a single kernel for the whole sequence instead of SageAttention's general entry point; the packed query can be read
+  from strided rows (for example the very rows of a projection), and the output written back to strided rows.
+- **P.V by value fragment**: SageAttention computes P.V for a 64-key tile with all its FP16 accumulators alive across 64 products. SageGP
+  issues the products one 16-channel value fragment per basic block: each FP16 accumulator lives for 8 products instead of 64, its
+  conversion to FP32 overlaps the next fragment's products, and the V fragments are read two fragments ahead. Every accumulator receives
+  the same products in the same order, so the output is bit-identical to the plain schedule.
+- **Staggered blocks**: the two thread blocks that share a multiprocessor start (and end) 700 cycles apart, so that their tensor-core
+  phases interleave instead of competing.
+
+Together these make a long-sequence call 5 to 10 % faster than SageAttention 2.2 on an RTX 50-series GPU.
+
+### Adaptive: a per-head format chosen on the activations
+
+- **Channel ranking**: each head ranks its 128 score channels by their energy on sampled K rows (weighted by the queries' energy when they
+  are available), after centring K. The same permutation packs Q and K, so it costs nothing in Q.K.
+- **Score widths**: a head keeps 32, 64 or 128 INT8 channels, or 64 INT8 channels plus 64 channels in NVFP4 (E2M1 values with one E4M3
+  scale per 16 channels), read by the kernel in the same pass. Value widths of 32, 64, 96 or 128 channels are taken in a ranked basis
+  of the values fitted on sampled rows; the discarded components are fitted on pilot queries.
+- **Selection**: pilot queries attend to sampled keys in every candidate format; the cheapest format per head whose estimated output
+  error, measured on held-out queries, keeps the whole launch within a 3.2 % budget wins. A selector kernel makes the choice on the GPU
+  and the attention kernel reads it per head, so no synchronization with the host is needed.
+- **Joint tiles**: for 48K to 131K tokens, K and V are packed into one tiled buffer that the kernel loads with TMA (the
+  Blackwell tensor memory accelerator).
+
+### Fast: full NVFP4 scores with error feedback
+
+SageAttention 3 also computes the scores in NVFP4 (twice the INT8 tensor-core rate), but rounds each 16-channel block independently.
+SageGP keeps the same speed and packs Q and K so that the score error is 50 to 70 % of SageAttention 3's:
+
+- **Rotation**: Q and the centred K are multiplied by one signed Hadamard matrix (Sylvester order, fixed random signs), which is exact in
+  Q.K and spreads outlier channels over all channels before rounding.
+- **Error feedback in the partner's metric**: each 16-channel block of a row is rounded to NVFP4, then its rounding error is spread over
+  the later channels of the same row through the matrix that minimizes the error of the score, measured with the second moments of the
+  other operand (the keys' rounding is weighted by the queries' statistics when the queries are available, and conversely), as GPTQ
+  does for weights. The second moments
+  come from 1,024 sampled rows, with 2 % damping.
+- **Graph-safe linear algebra**: the spread matrices are computed with Newton-Schulz inverses and Schur downdates in a Triton kernel (FP16
+  products, FP32 accumulation), matrix products only, so no host synchronization or library call breaks a CUDA graph.
+- **One scale per row**: each score is one block-scaled NVFP4 product over all 128 channels (two k64 parts); the row scale is a constant
+  unit, which removes the per-row dequantization from the inner loop. Values stay in FP8 as in SageAttention 2.
+
+### Wide heads (256 channels)
+
+Adaptive and Fast use a dedicated kernel for 256-channel heads: each head's channel ranges are measured while it is packed, and a row of
+128 bytes holds 96 INT8 channels, 48 scaled E2M1 channels and their microscales when the compact form fits; the head keeps all 256
+score channels wherever it would not.
+
+## License and attribution
+
+SageGP is licensed under the Apache License 2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). It is based on SageAttention by the
+SageAttention team; please cite their papers ([README_SageAttention.md](README_SageAttention.md)) when you use it in research.
+
+The optimizations SageGP adds on top of SageAttention (the RTX 50xx kernels and their build scripts in `csrc/sm120`, the packing,
+selection and error-feedback kernels in `sagegp`, and the techniques described above) were developed by DeepBeepMeep for WanGP. If you
+reuse them, in code or as a method, please credit **SageGP by DeepBeepMeep** with a link to this repository
+(https://github.com/deepbeepmeep/SageGP) in your documentation, release notes or paper. Redistributions of the code must keep the
+[NOTICE](NOTICE) file, as the Apache License requires.
+
+```
+@misc{sagegp,
+  author       = {DeepBeepMeep},
+  title        = {SageGP: faster precise, adaptive and FP4 attention kernels for GeForce Blackwell},
+  year         = {2026},
+  howpublished = {\url{https://github.com/deepbeepmeep/SageGP}}
+}
+```
