@@ -15,17 +15,42 @@
  */
 
 #include "../utils.cuh"
-#include "../stream.cuh"
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <torch/extension.h>
+
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor_struct.h>
+
+#include "../torch_version.h"
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_10_0
+#include <torch/csrc/stable/tensor_inl.h>
+#endif
+
+#include <torch/headeronly/core/ScalarType.h>
 
 #include "../wgmma.cuh"
 #include "../math.cuh"
 #include "../dispatch_utils.h"
 
 #include "attn_utils.cuh"
+
+using torch::stable::Tensor;
+
+#define DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, ...)             \
+  if (head_dim == 64) {                                             \
+    constexpr int HEAD_DIM = 64;                                    \
+    __VA_ARGS__                                                     \
+  } else if (head_dim == 128) {                                     \
+    constexpr int HEAD_DIM = 128;                                   \
+    __VA_ARGS__                                                     \
+  } else {                                                          \
+    std::ostringstream err_msg;                                     \
+    err_msg << "SM90 kernel does not support head_dim="             \
+            << int(head_dim) << ". Only 64 and 128 are supported. " \
+            << "Use SM80 or SM89 kernels for head_dim=256.";        \
+    throw std::invalid_argument(err_msg.str());                     \
+  }
 
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, CUtensorMapL2promotion_enum promotion_mode=CU_TENSOR_MAP_L2_PROMOTION_NONE, typename T>
 CUtensorMap create_tensor_map_4D(T* gmem_ptr, int d1, int d2, int d3, int d4, int stride1, int stride2, int stride3) {
@@ -567,18 +592,18 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   }
 }
 
-torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
-                  torch::Tensor query,
-                  torch::Tensor key,
-                  torch::Tensor value,
-                  torch::Tensor output,
-                  torch::Tensor query_scale,
-                  torch::Tensor key_scale,
-                  int tensor_layout,
-                  int is_causal,
-                  int qk_quant_gran,
-                  float sm_scale,
-                  int return_lse)
+Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
+                  Tensor query,
+                  Tensor key,
+                  Tensor value,
+                  Tensor output,
+                  Tensor query_scale,
+                  Tensor key_scale,
+                  int64_t tensor_layout,
+                  int64_t is_causal,
+                  int64_t qk_quant_gran,
+                  double sm_scale,
+                  int64_t return_lse)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -594,11 +619,11 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
   CHECK_CONTIGUOUS(query_scale);
   CHECK_CONTIGUOUS(key_scale);
 
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, at::ScalarType::Float8_e4m3fn);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
+  CHECK_DTYPE(query, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(key, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(value, torch::headeronly::ScalarType::Float8_e4m3fn);
+  CHECK_DTYPE(query_scale, torch::headeronly::ScalarType::Float);
+  CHECK_DTYPE(key_scale, torch::headeronly::ScalarType::Float);
 
   CHECK_DIMS(query, 4);
   CHECK_DIMS(key, 4);
@@ -669,17 +694,15 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
     throw std::invalid_argument(err_msg.str());  
   }
 
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
+  Tensor lse = return_lse 
+    ? torch::stable::new_empty(query, {batch_size, num_qo_heads, qo_len}, std::make_optional(torch::headeronly::ScalarType::Float))
+    : torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float));
 
   const int num_kv_groups = num_qo_heads / num_kv_heads;
 
   auto output_type = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
@@ -707,6 +730,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
               static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp) || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread), "Unsupported quantization granularity");
             }
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -716,9 +741,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
             cudaFuncSetAttribute(
                 kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
-            
+              
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize, sage_current_stream()>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,
@@ -738,19 +763,19 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(
   return lse;
 }
 
-torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
-                    torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    torch::Tensor value_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse)
+Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
+                    Tensor query,
+                    Tensor key,
+                    Tensor value,
+                    Tensor output,
+                    Tensor query_scale,
+                    Tensor key_scale,
+                    Tensor value_scale,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -768,12 +793,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
   CHECK_CONTIGUOUS(key_scale);
   CHECK_CONTIGUOUS(value_scale);
 
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
-  CHECK_DTYPE(value, at::ScalarType::Float8_e4m3fn);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
-  CHECK_DTYPE(value_scale, torch::kFloat32);
+  CHECK_DTYPE(query, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(key, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(value, torch::headeronly::ScalarType::Float8_e4m3fn);
+  CHECK_DTYPE(query_scale, torch::headeronly::ScalarType::Float);
+  CHECK_DTYPE(key_scale, torch::headeronly::ScalarType::Float);
+  CHECK_DTYPE(value_scale, torch::headeronly::ScalarType::Float);
 
   CHECK_DIMS(query, 4);
   CHECK_DIMS(key, 4);
@@ -845,17 +870,15 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
     throw std::invalid_argument(err_msg.str());  
   }
 
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
+  Tensor lse = return_lse 
+    ? torch::stable::new_empty(query, {batch_size, num_qo_heads, qo_len}, std::make_optional(torch::headeronly::ScalarType::Float))
+    : torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float));
 
   const int num_kv_groups = num_qo_heads / num_kv_heads;
 
   auto output_dtype = output.scalar_type();
 
-  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM_SM90(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
       DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
         DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
@@ -885,6 +908,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
 
             CHECK_SHAPE(value_scale, batch_size, num_kv_heads, head_dim);
 
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
             CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, HEAD_DIM>(reinterpret_cast<int8_t*>(query.data_ptr()), batch_size, num_qo_heads, qo_len, HEAD_DIM, stride_bz_q, stride_h_q, stride_seq_q);
             CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, HEAD_DIM>(reinterpret_cast<int8_t*>(key.data_ptr()), batch_size, num_kv_heads, kv_len, HEAD_DIM, stride_bz_k, stride_h_k, stride_seq_k);
             CUtensorMap tma_map_V = create_tensor_map_4D<HEAD_DIM, CTA_K>(reinterpret_cast<int8_t*>(value.data_ptr()), batch_size, num_kv_heads, HEAD_DIM, value.size(3), stride_bz_v, stride_h_v, stride_d_v);
@@ -894,9 +919,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(
             cudaFuncSetAttribute(
                 kernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
-            
+              
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-            kernel<<<grid, NUM_THREADS, sMemSize, sage_current_stream()>>>(
+            kernel<<<grid, NUM_THREADS, sMemSize, stream>>>(
               tma_map_Q,
               tma_map_K,
               tma_map_V,

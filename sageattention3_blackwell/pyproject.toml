@@ -1,0 +1,12 @@
+[build-system]
+requires = [
+    "numpy",
+    "packaging",
+    "setuptools",
+
+    # torch version will be added by update_pyproject.py
+    "torch",
+]
+
+[tool.cibuildwheel.windows]
+repair-wheel-command = ""

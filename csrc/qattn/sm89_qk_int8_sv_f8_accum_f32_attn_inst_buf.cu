@@ -1,17 +1,17 @@
-#include "attn_cuda_sm89.h"
+// #include "attn_cuda_sm89.h"
 #include "qk_int_sv_f8_cuda_sm89.cuh"
-#include "../stream.cuh"
-torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
-                    torch::Tensor key,
-                    torch::Tensor value,
-                    torch::Tensor output,
-                    torch::Tensor query_scale,
-                    torch::Tensor key_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse)
+
+Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(Tensor query,
+                    Tensor key,
+                    Tensor value,
+                    Tensor output,
+                    Tensor query_scale,
+                    Tensor key_scale,
+                    int64_t tensor_layout,
+                    int64_t is_causal,
+                    int64_t qk_quant_gran,
+                    double sm_scale,
+                    int64_t return_lse)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -27,12 +27,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
   CHECK_CONTIGUOUS(query_scale);
   CHECK_CONTIGUOUS(key_scale);
 
-  CHECK_DTYPE(query, torch::kInt8);
-  CHECK_DTYPE(key, torch::kInt8);
+  CHECK_DTYPE(query, torch::headeronly::ScalarType::Char);
+  CHECK_DTYPE(key, torch::headeronly::ScalarType::Char);
   // TODO: how to check fp8 data type?
-  // CHECK_DTYPE(value, torch::kHalf);
-  CHECK_DTYPE(query_scale, torch::kFloat32);
-  CHECK_DTYPE(key_scale, torch::kFloat32);
+  // CHECK_DTYPE(value, torch::headeronly::ScalarType::Half);
+  CHECK_DTYPE(query_scale, torch::headeronly::ScalarType::Float);
+  CHECK_DTYPE(key_scale, torch::headeronly::ScalarType::Float);
 
   CHECK_DIMS(query, 4);
   CHECK_DIMS(key, 4);
@@ -101,11 +101,9 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
     throw std::invalid_argument(err_msg.str());  
   }
 
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse)
-  {
-    lse = torch::empty({batch_size, num_qo_heads, qo_len}, query.options().dtype(torch::kFloat32));
-  }
+  Tensor lse = return_lse 
+    ? torch::stable::new_empty(query, {batch_size, num_qo_heads, qo_len}, std::make_optional(torch::headeronly::ScalarType::Float))
+    : torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float));
 
   const int num_kv_groups = num_qo_heads / num_kv_heads;
 
@@ -118,7 +116,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
             constexpr int CTA_Q = 128;
             constexpr int CTA_K = 64;
-            constexpr int WARP_Q = 32;
+            constexpr int WARP_Q = (HEAD_DIM == 256) ? 16 : 32;
             constexpr int WARP_K = 64;
 
             assert(value.size(0) == batch_size);
@@ -151,10 +149,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_attn_inst_buf(torch::Tensor query,
 
             dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
             dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
+            const auto device_guard = make_device_guard(query);
+            const auto stream = get_current_cuda_stream(query);
 
-            kernel_func<<<grid, block, smem_max, sage_current_stream()>>>(
-              query.data_ptr<int8_t>(), 
-              key.data_ptr<int8_t>(),
+            kernel_func<<<grid, block, smem_max, stream>>>(
+              reinterpret_cast<int8_t*>(query.data_ptr()), 
+              reinterpret_cast<int8_t*>(key.data_ptr()),
               reinterpret_cast<int8_t*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
               (RETURN_LSE) ? reinterpret_cast<float*>(lse.data_ptr()) : nullptr,

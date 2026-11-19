@@ -14,12 +14,61 @@
  * limitations under the License.
  */
 
-#include <pybind11/pybind11.h>
-#include <torch/extension.h>
+#include <Python.h>
+#include <torch/csrc/stable/library.h>
+
 #include "attn_cuda_sm90.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+/* Creates a dummy empty _C module that can be imported from Python.
+   The import from Python will load the .so consisting of this file
+   in this extension, so that the TORCH_LIBRARY static initializers
+   below are run. */
+PyMODINIT_FUNC PyInit__qattn_sm90(void)
 {
-  m.def("qk_int8_sv_f8_accum_f32_attn_inst_buf", &qk_int8_sv_f8_accum_f32_attn_inst_buf);
-  m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", &qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf);
+    static struct PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "_qattn_sm90",  /* name of module */
+        NULL,           /* module documentation, may be NULL */
+        -1,             /* size of per-interpreter state of the module,
+                           or -1 if the module keeps state in global variables. */
+        NULL,           /* methods */
+    };
+    return PyModule_Create(&module_def);
+}
+
+// Defines the operators
+STABLE_TORCH_LIBRARY(sageattention_qattn_sm90, m) {
+    m.def("qk_int8_sv_f8_accum_f32_attn_inst_buf("
+            "Tensor query, "
+            "Tensor key, "
+            "Tensor value, "
+            "Tensor(a!) output, "
+            "Tensor query_scale, "
+            "Tensor key_scale, "
+            "int tensor_layout, "
+            "int is_causal, "
+            "int qk_quant_gran, "
+            "float sm_scale, "
+            "int return_lse"
+          ") -> Tensor");
+    m.def("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf("
+            "Tensor query, "
+            "Tensor key, "
+            "Tensor value, "
+            "Tensor(a!) output, "
+            "Tensor query_scale, "
+            "Tensor key_scale, "
+            "Tensor value_scale, "
+            "int tensor_layout, "
+            "int is_causal, "
+            "int qk_quant_gran, "
+            "float sm_scale, "
+            "int return_lse"
+          ") -> Tensor");
+}
+
+// Registers CUDA implementations
+STABLE_TORCH_LIBRARY_IMPL(sageattention_qattn_sm90, CUDA, m) {
+    m.impl("qk_int8_sv_f8_accum_f32_attn_inst_buf", TORCH_BOX(qk_int8_sv_f8_accum_f32_attn_inst_buf));
+    m.impl("qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf", TORCH_BOX(qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf));
 }

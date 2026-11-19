@@ -18,7 +18,6 @@
 #include "../utils.cuh"
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
-#include <torch/extension.h>
 
 #include "../cp_async.cuh"
 #include "../mma.cuh"
@@ -127,7 +126,7 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
 #pragma unroll
     for (uint32_t j = 0; j < smem_iters_row; j++)
     {
-      smem.load_128b_async<cp_async::SharedMemFillMode::kNoFill>(smem_offset, *lane_ptr, base_idx < max_len);
+      smem.load_128b_async<cp_async::SharedMemFillMode::kFillZero>(smem_offset, *lane_ptr, base_idx < max_len);
       *lane_ptr += (global_to_shared_line_lanes * pack_size);
       smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
     }

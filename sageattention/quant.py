@@ -18,6 +18,7 @@ import torch
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 from . import _fused
+_fused = torch.ops.sageattention_fused
 
 def per_block_int8(
     q: torch.Tensor, 
@@ -93,7 +94,7 @@ def per_block_int8(
     
     sm_scale *= 1.44269504
 
-    _fused.quant_per_block_int8_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
+    _fused.quant_per_block_int8_scale_cuda(q, q_int8, q_scale, sm_scale, BLKQ, _tensor_layout)
     if km is not None:
         km = km.squeeze(1) if _tensor_layout == 0 else km.squeeze(2)
         _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, km, k_int8, k_scale, BLKK, _tensor_layout)
