@@ -1,9 +1,12 @@
 """Build the all-NVFP4 score kernel (FP8 values) of the Fast precision (sagegp/sm120/fast.py).
 
-python build.py [/path/to/SageAttention] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
+python build.py [/path/to/SageAttention] [--split] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
+--split builds fixed_split_sm120a.cubin instead: the same kernel over a range of the keys (split_query.cu, with the precise split's
+patch of ../precise/build.py), merged by sagegp.sm120.dense for the query blocks of a part-filled last wave.
 It specializes the production dense kernel (../build.py, pinned SageAttention revision) so that each score is one block-scaled
 NVFP4 product over all 128 channels (scaled_qk.cuh, two k64 parts), with constant row units (the packer writes 0.125)."""
 import argparse
+import runpy
 import shutil
 import subprocess
 import sys
@@ -19,6 +22,7 @@ def main():
     parser.add_argument("sage_source", type=Path, nargs="?", default=PARENT.parents[1])
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--ccbin")
+    parser.add_argument("--split", action="store_true")
     args = parser.parse_args()
     script = (PARENT / "build.py").read_text(encoding="utf-8")
     replacements = (("CUBINS = ROOT / \"sagegp\" / \"sm120\" / \"cubins\"", "CUBINS = HERE"),
@@ -53,6 +57,18 @@ def main():
         header = (HERE / "scaled_qk.cuh").read_text(encoding="utf-8")
         (work / "mixed_qk.cuh").write_text("#define SCORE_PARTS 2\n#define INT8_PREFIX_FRAGMENTS 0\n" + header, encoding="utf-8")
         shutil.copyfile(PARENT / "online_softmax.cuh", work / "online_softmax.cuh")
+        if args.split:  # this specialization's headers, then the precise split's patch of the kernel
+            split = work / "split"
+            split.mkdir()
+            runpy.run_path(str(work / "build.py"))["write_headers"](split, args.sage_source)
+            kernel = split / "qattn" / "qk_int_sv_f8_cuda_sm89.cuh"
+            split_keys = runpy.run_path(str(PARENT / "precise" / "build.py"))["split_keys"]
+            kernel.write_text(split_keys(kernel.read_text(encoding="utf-8")), encoding="utf-8")
+            shutil.copyfile(HERE / "split_query.cu", split / "split_query.cu")
+            command = [args.nvcc, "--cubin", "-arch=sm_120a", "-O3", "--use_fast_math", "-std=c++17"] + (["-ccbin", args.ccbin] if args.ccbin else [])
+            subprocess.run([*command, str(split / "split_query.cu"), "-o", str(split / "fixed_split_sm120a.cubin")], cwd=split, check=True)
+            shutil.copyfile(split / "fixed_split_sm120a.cubin", PARENT.parents[1] / "sagegp" / "sm120" / "cubins" / "fixed_split_sm120a.cubin")
+            return
         command = [sys.executable, str(work / "build.py"), str(args.sage_source), "--strided-query", "--nvcc", args.nvcc]
         if args.ccbin:
             command += ["--ccbin", args.ccbin]

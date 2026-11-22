@@ -43,9 +43,9 @@ uninstall `sageattention` first.
 ```
 pip uninstall -y sageattention
 # Windows
-pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.1/sagegp-1.0.1+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
 # Linux (glibc 2.28 or newer)
-pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.1/sagegp-1.0.1+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
 ```
 
 The wheels work with any Python from 3.10 and PyTorch 2.10 or newer built for CUDA 13 (PyTorch's stable ABI), on GPUs from the RTX 30
@@ -102,13 +102,14 @@ sagegp.hooks.register_constant = my_graph_manager.register_constant  # returns t
 sagegp.hooks.notice = lambda operation: print("kernel:", operation)   # optional: log the optional routes taken
 ```
 
-### Last-wave split (1.0.1)
+### Last-wave split (1.0.1, Fast and Adaptive in 1.0.2)
 
 A launch over few heads (attention computed head group by head group to save VRAM) often ends on a part-filled wave: its last query
 blocks run while most of the GPU waits. SageGP can run those blocks over ranges of the keys instead, each range writing its normalized
 output and log2-sum-exp, merged in FP32 in a fixed order (deterministic): the full waves run the unchanged kernel. It pays where the
 last wave is part-filled (one to four heads of a long sequence: 4 to 19 % faster for the RTX 50xx Precise
-kernel) and does nothing otherwise. Kernels: RTX 50xx Precise (`sagegp.sm120.dense.SPLIT_KEYS = True`), SageAttention 2's SM89 kernel
+kernel, 3 to 20 % for Fast, 2 to 16 % for Adaptive's kernels at 50k tokens) and does nothing otherwise. Kernels: RTX 50xx Precise, Fast
+and Adaptive (every routed variant, the TMA ones included; `sagegp.sm120.dense.SPLIT_KEYS = True`), SageAttention 2's SM89 kernel
 (`sagegp.sm89.split.attention`) and its Triton per-block kernel (`sagegp.triton_split`), with the plan and merge in
 `sagegp.split_merge` (CUDA and ROCm occupancy queries). Off by default.
 

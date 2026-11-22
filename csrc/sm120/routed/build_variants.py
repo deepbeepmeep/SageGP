@@ -2,6 +2,7 @@
 """Specialize the Sage2 tile loads and tensor-core loops for the routed head widths."""
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 
@@ -62,17 +63,38 @@ def with_joint_tiles(kernel):
     return kernel[:start] + '#include "joint_tiles.cuh"\n' + kernel[end:]
 
 
-def build_variants(work, command, *, joint_tiles=False, split_kv=False, single_key=False):
+def with_split_keys(kernel, value_width):
+    """The precise split's patch (../precise/build.py: the kernel over blockIdx.z's range of the keys, its output and lse at that
+    index), and the key planes the value variants address themselves from the head's first tile."""
+    kernel = runpy.run_path(str(HERE.parent / "precise" / "build.py"))["split_keys"](kernel)
+    planes = "load_planes<ScoreMode>(K,smem_K,head_id,kv_len,"
+    assert kernel.count(planes) == (3 if value_width and "joint_tiles.cuh" not in kernel else 0)
+    return kernel.replace(planes, "load_planes<ScoreMode>(K,smem_K,head_id,kv_len_all,kv_start/CTA_K+")
+
+
+def split_joint_tiles(text):
+    """joint_tiles.cuh over a range of the keys: its records counted from the head's first tile."""
+    record = "const size_t record = size_t(head_id) * num_iterations + tile;"
+    assert text.count(record) == 1
+    return text.replace(record, "const size_t record = size_t(head_id) * div_ceil(kv_len_all, CTA_K) + kv_start / CTA_K + tile;")
+
+
+def build_variants(work, command, *, joint_tiles=False, split_kv=False, single_key=False, split_keys=False):
+    """split_keys: the images over ranges of the keys (split_attention.cu, `<name>_keys_sm120a.cubin`) instead."""
     kernel = work / "qattn/qk_int_sv_f8_cuda_sm89.cuh"
     utils = work / "qattn/attn_utils.cuh"
     original = kernel.read_text(), utils.read_text()
     shutil.copyfile(HERE / "router_planes.cuh", work / "qattn/router_planes.cuh")
-    source = work / "attention.cu"
+    source = work / ("split_attention.cu" if split_keys else "attention.cu")
     shutil.copyfile(HERE / source.name, source)
     images = []
     modes = [(w, 2) for w in (32, 64, 96, 128)]
     if joint_tiles:
-        shutil.copyfile(HERE / "joint_tiles.cuh", work / "qattn/joint_tiles.cuh")
+        tiles = (HERE / "joint_tiles.cuh").read_text(encoding="utf-8")
+        (work / "qattn/joint_tiles.cuh").write_text(split_joint_tiles(tiles) if split_keys else tiles, encoding="utf-8")
+    if joint_tiles or split_keys:
+        if split_keys and not joint_tiles:
+            modes = [(0, m) for m in range(4)] + modes
     else:
         selector = work / "selector_sm120a.cubin"
         subprocess.run([*command, str(HERE / "selector.cu"), "-o", str(selector)], cwd=work, check=True)
@@ -82,12 +104,14 @@ def build_variants(work, command, *, joint_tiles=False, split_kv=False, single_k
         code, helpers = specialize(*original, score_mode, value_width)
         if joint_tiles:
             code = with_joint_tiles(code)
+        if split_keys:
+            code = with_split_keys(code, value_width)
         kernel.write_text(code, encoding="utf-8")
         utils.write_text(helpers, encoding="utf-8")
         name = f"value{value_width}" if value_width else f"score{score_mode}"
         if joint_tiles:
             name = ("single_" if single_key else "split_" if split_kv else "joint_") + name
-        image = work / f"{name}_sm120a.cubin"
+        image = work / f"{name}{'_keys' if split_keys else ''}_sm120a.cubin"
         subprocess.run([*command, f"-DVALUE_WIDTH={value_width}", f"-DSCORE_MODE={score_mode}", f"-DSPLIT_KV={int(split_kv)}", f"-DSINGLE_K={int(single_key)}",
                         str(source), "-o", str(image)], cwd=work, check=True)
         images.append(image)

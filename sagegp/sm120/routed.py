@@ -522,15 +522,18 @@ def _restore(x, settings):
 
 
 @lru_cache(None)
-def _kernels(device, fast, joint=False, split=False, single=False):
+@lru_cache(None)
+def _kernels(device, fast, joint=False, split=False, single=False, keys=False):
+    """The routed variants' kernels; keys: their images over ranges of the keys (dense.SPLIT_KEYS: the last wave's query blocks)."""
     directory = Path(__file__).with_name("cubins") / "routed"
     variants = ("value32", "value64", "value96", "value128") if fast else ("score0", "score1", "score2", "score3")
     if joint or split or single:
         prefix = "single_" if single else "split_" if split else "joint_"
         variants = tuple(prefix + name for name in variants)
-    symbol = "wangp_dense_nvfp4_strided_q"
+    symbol = "wangp_dense_routed_split" if keys else "wangp_dense_nvfp4_strided_q"
+    suffix = "_keys" if keys else ""
     with torch.cuda.device(device):
-        kernels = tuple(torch.cuda._utils._cuda_load_module((directory / f"{v}_sm120a.cubin").read_bytes(), [symbol])[symbol]
+        kernels = tuple(torch.cuda._utils._cuda_load_module((directory / f"{v}{suffix}_sm120a.cubin").read_bytes(), [symbol])[symbol]
                         for v in variants)
         if joint or split or single:
             for kernel in kernels:
@@ -544,7 +547,8 @@ def staged_attention(out, packed, settings, mask=None):
     joint, split = fast and width == _JOINT_WIDTH, fast and width == _TILED_KEY_WIDTH
     single = fast and width == 128
     return dense._staged_attention(out, packed, settings, mask, _kernels(out.device, fast, joint, split, single),
-                                   _restore if fast else None, 49152 if joint or split or single else 32768)
+                                   _restore if fast else None, 49152 if joint or split or single else 32768,
+                                   split_kernels=_kernels(out.device, fast, joint, split, single, True) if dense.SPLIT_KEYS else ())
 
 
 def attention_owned(inputs, *, recycle_q, out=None):

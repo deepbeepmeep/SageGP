@@ -317,7 +317,7 @@ if not SKIP_CUDA_BUILD:
 
 setup(
     name='sagegp',
-    version='1.0.1' + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
+    version='1.0.2' + os.environ.get("SAGEATTENTION_WHEEL_VERSION_SUFFIX", ""),
     author='DeepBeepMeep (SageGP), SageAttention team (SageAttention 2), woct0rdho (Windows and stable ABI builds)',
     license='Apache 2.0 License',
     description='SageAttention 2 for every GPU, with faster precise, adaptive and fast (FP4) attention on GeForce Blackwell.',

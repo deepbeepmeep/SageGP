@@ -1,6 +1,8 @@
 """Rebuild the SM120a device images of sagegp/sm120/cubins from the pinned Apache-2.0 SageAttention CUDA headers.
 
-python build.py [/path/to/SageAttention] [--routed | --joint-tiles | --split-tiles | --single-key] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
+python build.py [/path/to/SageAttention] [--routed | --joint-tiles | --split-tiles | --single-key] [--split-keys] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
+--split-keys (with the routed and tiled variants): their images over ranges of the keys, `<name>_keys_sm120a.cubin` (the last wave's
+query blocks, merged by sagegp.sm120.dense).
 The headers are read from this repository's git history at REVISION (SageAttention 2.2), by default.
 The build reads the named git objects so local changes cannot affect the device image.
 """
@@ -63,6 +65,7 @@ def main():
     variant.add_argument("--joint-tiles", action="store_true", help="Build the dense Fast TMA kernels")
     variant.add_argument("--split-tiles", action="store_true", help="Build the dense Fast TMA kernels for separately packed K and V")
     variant.add_argument("--single-key", action="store_true", help="Build the dense Fast TMA kernels for keys packed after score selection")
+    parser.add_argument("--split-keys", action="store_true", help="With the routed and tiled variants: their images over ranges of the keys")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as temp:
         work = Path(temp)
@@ -73,7 +76,7 @@ def main():
         if args.routed or args.joint_tiles or args.split_tiles or args.single_key:
             from routed.build_variants import build_variants
             build_variants(work, command, joint_tiles=args.joint_tiles or args.split_tiles or args.single_key,
-                           split_kv=args.split_tiles or args.single_key, single_key=args.single_key)
+                           split_kv=args.split_tiles or args.single_key, single_key=args.single_key, split_keys=args.split_keys)
             return
         source = "strided_query.cu" if args.strided_query else "dense.cu"
         image = "strided_query_sm120a.cubin" if args.strided_query else "dense_sm120a.cubin"

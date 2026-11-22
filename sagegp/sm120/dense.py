@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from .. import split_merge
 from .common import _pack_pairs, recyclable_query
 from .rows import _rows
 from .values import pack_value
@@ -43,13 +44,13 @@ def _precise_kernel(device):
         return torch.cuda._utils._cuda_load_module(image.read_bytes(), ["wangp_dense_nvfp4_strided_q"])["wangp_dense_nvfp4_strided_q"]
 
 
-# Split keys (precise mode, comparison switch): the query blocks of a launch's part-filled last wave run over ranges of the keys
-# (precise_split_sm120a.cubin), each range's normalized output and log2-sum-exp merged after (_merge_splits); the full waves before
-# them run as before. Only the tail's ranges take VRAM: a wave of CTAs' outputs (about 11 MB on an RTX 5090).
+# Split keys (precise and Fast modes, comparison switch): the query blocks of a launch's part-filled last wave run over ranges of the
+# keys (precise_split_sm120a.cubin, fixed_split_sm120a.cubin), each range's normalized output and log2-sum-exp merged after
+# (_merge_splits); the full waves before them run as before. Only the tail's ranges take VRAM: a wave of CTAs' outputs (about 11 MB
+# on an RTX 5090).
 SPLIT_KEYS = False
 SPLIT_RANGES = 8  # ranges of the keys of the last wave's blocks
 SPLIT_MIN_KEY_BLOCKS = 16  # 64-key blocks per range at least
-CTAS_PER_SM = 2  # the precise kernel's occupancy (128 threads, 32 KB of shared memory)
 
 
 @lru_cache(None)
@@ -60,11 +61,11 @@ def _split_kernel(device):
 
 
 @lru_cache(None)
-def _tail_split(device, blocks, heads, key_blocks):
+def _tail_split(device, blocks, heads, key_blocks, kernel, shared_mem):
     """(query blocks run whole, ranges of keys of the blocks after them): the blocks of the last, part-filled wave of the GPU's CTA slots
-    split in SPLIT_RANGES (measured on an RTX 5090 at 220k tokens: 8 ranges 4 to 19 % faster for 1 to 4 heads, splitting earlier waves
-    too never faster)."""
-    slots = torch.cuda.get_device_properties(device).multi_processor_count * CTAS_PER_SM
+    (SMs x the main kernel's occupancy: 2 for the precise and Fast kernels) split in SPLIT_RANGES (measured on an RTX 5090 at 220k
+    tokens: 8 ranges 4 to 19 % faster for 1 to 4 heads, splitting earlier waves too never faster)."""
+    slots = torch.cuda.get_device_properties(device).multi_processor_count * split_merge.occupancy(kernel, 128, shared_mem)
     main = blocks * heads // slots * slots // heads
     splits = min(SPLIT_RANGES, key_blocks // SPLIT_MIN_KEY_BLOCKS)
     return (main, splits) if main < blocks and splits > 1 else (blocks, 1)
@@ -236,11 +237,14 @@ def fused_warp_key(x, rope, norm, settings, *, interleaved, rope_first):
 
 
 def staged_attention(out, packed, settings, mask=None):
-    kernels = (_precise_kernel(out.device),) if settings.get("int8_scores", False) else None
-    return _staged_attention(out, packed, settings, mask, kernels)
+    precise = settings.get("int8_scores", False)
+    return _staged_attention(out, packed, settings, mask, (_precise_kernel(out.device),) if precise else None,
+                             split_kernels=(_split_kernel(out.device),) if precise else ())
 
 
-def _staged_attention(out, packed, settings, mask, kernels=None, restore=None, shared_mem=32768):
+def _staged_attention(out, packed, settings, mask, kernels=None, restore=None, shared_mem=32768, split_kernels=()):
+    """split_kernels: the kernels' images over ranges of the keys (wangp_dense_precise_split's arguments), each launched as its
+    kernel is, for SPLIT_KEYS: the tail is planned for all heads (a routed launch's heads that chose another variant exit at once)."""
     if mask is not None:
         raise ValueError("The dense NVFP4 kernel requires unmasked attention")
     (q, qs), (k, ks), (v, vs, _mean) = packed
@@ -282,8 +286,8 @@ def _staged_attention(out, packed, settings, mask, kernels=None, restore=None, s
             for first in range(0, full_blocks, per_launch):
                 kernels[-1]((min(full_blocks - first, per_launch), h, 1), (32, 4, 1),
                             [*full_args, first], shared_mem=shared_mem, stream=stream)
-        main, splits = (_tail_split(q.device, blocks, h, triton.cdiv(n, 64)) if SPLIT_KEYS and settings.get("int8_scores", False) and not full_blocks
-                        and strided_query else (blocks, 1))
+        main, splits = (_tail_split(q.device, blocks, h, triton.cdiv(n, 64), kernels[-1], shared_mem) if SPLIT_KEYS and split_kernels
+                        and not full_blocks and strided_query else (blocks, 1))
         for first in range(full_blocks, main, per_launch):
             for kernel in kernels:
                 kernel((min(main - first, per_launch), h, 1), (32, 4, 1), [*args, first], shared_mem=shared_mem, stream=stream)
@@ -291,11 +295,13 @@ def _staged_attention(out, packed, settings, mask, kernels=None, restore=None, s
             # the tail's ranges of keys into their own outputs and lse, then merged into out's tail rows (which may hold the tail's packed
             # queries: written after)
             rows, split_len = t - main * 128, triton.cdiv(triton.cdiv(n, 64), splits) * 64
-            parts = torch.empty((splits, rows, h, 128), device=q.device, dtype=out.dtype)
+            # (zeros where a routed value width leaves channels unwritten: the merge reads all 128)
+            parts = (torch.empty if restore is None else torch.zeros)((splits, rows, h, 128), device=q.device, dtype=out.dtype)
             lse = torch.empty((splits, h, rows), device=q.device, dtype=torch.float32)
             split_args = [q, k, v, parts, lse, qs, ks, vs, settings["mixed"], t, n, h, v.size(3), rows * h * 128, h * 128, 128, q.stride(2), q.stride(1),
                           main, splits, split_len, main, rows]
-            _split_kernel(q.device)((blocks - main, h, splits), (32, 4, 1), split_args, shared_mem=shared_mem, stream=stream)
+            for split_kernel in split_kernels:
+                split_kernel((blocks - main, h, splits), (32, 4, 1), split_args, shared_mem=shared_mem, stream=stream)
             _merge_splits[(triton.cdiv(rows, 64), h)](parts, lse, out[:, main * 128:], rows, h, out.stride(1), out.stride(2), splits, 64, num_warps=4)
             del parts, lse
     torch.autograd.graph.increment_version(out)

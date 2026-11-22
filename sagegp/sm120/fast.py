@@ -184,8 +184,16 @@ def staged_quantize_q(q, settings):
     return out, torch.full((h, triton.cdiv(n, 128) * 4), UNIT, device=q.device)
 
 
+@lru_cache(None)
+def _split_kernel(device):
+    """The kernel over ranges of the keys (dense.SPLIT_KEYS: the last wave's query blocks)."""
+    with torch.cuda.device(device):
+        image = Path(__file__).with_name("cubins") / "fixed_split_sm120a.cubin"
+        return torch.cuda._utils._cuda_load_module(image.read_bytes(), ["wangp_dense_fast_split"])["wangp_dense_fast_split"]
+
+
 def staged_attention(out, packed, settings, mask=None):
-    return dense._staged_attention(out, packed, settings, mask, kernels=(_kernel(out.device),))
+    return dense._staged_attention(out, packed, settings, mask, kernels=(_kernel(out.device),), split_kernels=(_split_kernel(out.device),))
 
 
 def attention_owned(inputs, *, recycle_q, out=None):
