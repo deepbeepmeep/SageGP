@@ -2,5 +2,5 @@
 """SageGP: SageAttention 2 for every GPU, with faster precise, adaptive and fast modes on GeForce Blackwell (SM120)."""
 from .core import PRECISIONS, kernel_for, sageattn, sageattn3_blackwell, sageattn_fast
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __all__ = ["PRECISIONS", "kernel_for", "sageattn", "sageattn3_blackwell", "sageattn_fast", "__version__"]

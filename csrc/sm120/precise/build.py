@@ -6,7 +6,10 @@ that keep all their scores in INT8, with the same products and sums as SageAtten
 - the CTA of the odd shared-memory window of an SM starts 700 cycles late and the even one exits 700 cycles late, so that the two
   CTAs of an SM do not reach their tensor-core phases together.
 
-python build.py [/path/to/SageAttention] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
+--split builds precise_split_sm120a.cubin instead: the same kernel over a range of the keys (blockIdx.z), each range writing its output
+and its log2-sum-exp at its own index (split_query.cu), merged by sagegp.sm120.dense for the query blocks of a part-filled last wave.
+
+python build.py [/path/to/SageAttention] [--split] [--nvcc /path/to/nvcc] [--ccbin /path/to/compiler]
 """
 import argparse
 import runpy
@@ -78,6 +81,33 @@ def schedule(kernel):
     return kernel[:start] + "  if constexpr (!mixed && WGP_I8_LOOP)\n#include \"i8_loop.cuh\"\n  else {\n" + kernel[start:end] + "  }\n" + kernel[end:]
 
 
+def split_keys(kernel):
+    """The kernel over the keys [kv_start, kv_start + kv_split_len) of blockIdx.z's range (all of them when kv_split_len is 0), its output
+    and lse at index blockIdx.z, the key scales indexed over all the keys; the output and lse rows from query block out_first (out_rows
+    rows per range and head, qo_len when 0)."""
+    kernel = replace_once(kernel, "const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,",
+                          "const uint32_t qo_len, const uint32_t kv_len_all, const uint32_t num_kv_groups,")
+    kernel = replace_once(kernel, "float sm_scale, uint32_t query_block)",
+                          "float sm_scale, uint32_t query_block, const uint32_t num_splits = 1, const uint32_t kv_split_len = 0,"
+                          " const uint32_t out_first = 0, const uint32_t out_rows = 0)")
+    kernel = replace_once(kernel, "  const uint32_t batch_id = blockIdx.z;", """  const uint32_t out_batch = blockIdx.z;
+  const uint32_t batch_id = blockIdx.z / num_splits;
+  const uint32_t kv_start = kv_split_len ? (blockIdx.z % num_splits) * kv_split_len : 0;
+  const uint32_t kv_len = kv_split_len ? min(kv_len_all - kv_start, kv_split_len) : kv_len_all;""")
+    kernel = replace_once(kernel, "const uint32_t num_block_k = div_ceil(kv_len, CTA_K);", "const uint32_t num_block_k = div_ceil(kv_len_all, CTA_K);")
+    kernel = replace_once(kernel, "const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);",
+                          "const uint32_t num_warp_block_k = div_ceil(kv_len_all, CTA_K) * (CTA_K / WARP_K);", 2)
+    advance = "  constexpr uint32_t k_scale_advance_offset = "
+    line_end = kernel.index("\n", kernel.index(advance))
+    kernel = kernel[:line_end + 1] + "  k_scale_idx += (kv_start / CTA_K) * k_scale_advance_offset;\n" + kernel[line_end + 1:]
+    kernel = replace_once(kernel, "K + batch_id * stride_bz_k + ", "K + batch_id * stride_bz_k + kv_start * stride_seq_k + ")
+    kernel = replace_once(kernel, "V + batch_id * stride_bz_v + ", "V + batch_id * stride_bz_v + kv_start + ")
+    kernel = replace_once(kernel, "O + batch_id * stride_bz_o + head_id * stride_h_o + (bx * CTA_Q",
+                          "O + out_batch * stride_bz_o + head_id * stride_h_o + ((bx - out_first) * CTA_Q")
+    return replace_once(kernel, "Lse + batch_id * (qo_len * num_qo_heads) + head_id * qo_len + lse_idx",
+                        "Lse + out_batch * ((out_rows ? out_rows : qo_len) * num_qo_heads) + head_id * (out_rows ? out_rows : qo_len) + lse_idx - out_first * CTA_Q")
+
+
 def entry(text):
     body_start = text.index("  if (mixed_heads[blockIdx.y])")
     body_end = text.index("\n}", body_start) + 1
@@ -92,20 +122,24 @@ def main():
     parser.add_argument("sage_source", type=Path, nargs="?", default=BASE["ROOT"])
     parser.add_argument("--nvcc", default="nvcc")
     parser.add_argument("--ccbin")
+    parser.add_argument("--split", action="store_true")
     args = parser.parse_args()
+    source, image = ("split_query.cu", "precise_split_sm120a.cubin") if args.split else ("strided_query.cu", "precise_sm120a.cubin")
     with tempfile.TemporaryDirectory() as temp:
         work = Path(temp)
         BASE["write_headers"](work, args.sage_source)
         kernel = work / SM89
-        kernel.write_text(schedule(kernel.read_text(encoding="utf-8")), encoding="utf-8")
+        scheduled = schedule(kernel.read_text(encoding="utf-8"))
+        kernel.write_text(split_keys(scheduled) if args.split else scheduled, encoding="utf-8")
         for name in ("pv_stages.cuh", "xt_helpers.cuh", "int_qk.cuh", "i8_loop.cuh"):
             shutil.copyfile(HERE / name, work / "qattn" / name)
-        (work / "strided_query.cu").write_text(entry((HERE.parent / "strided_query.cu").read_text(encoding="utf-8")), encoding="utf-8")
+        entry_source = (HERE / source) if args.split else (HERE.parent / source)
+        (work / source).write_text(entry(entry_source.read_text(encoding="utf-8")), encoding="utf-8")
         command = [args.nvcc, "--cubin", "-arch=sm_120a", "-O3", "--use_fast_math", "-std=c++17"]
         if args.ccbin:
             command += ["-ccbin", args.ccbin]
-        subprocess.run([*command, str(work / "strided_query.cu"), "-o", str(work / "precise_sm120a.cubin")], cwd=work, check=True)
-        shutil.copyfile(work / "precise_sm120a.cubin", BASE["CUBINS"] / "precise_sm120a.cubin")
+        subprocess.run([*command, str(work / source), "-o", str(work / image)], cwd=work, check=True)
+        shutil.copyfile(work / image, BASE["CUBINS"] / image)
 
 
 if __name__ == "__main__":

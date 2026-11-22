@@ -43,6 +43,55 @@ def _precise_kernel(device):
         return torch.cuda._utils._cuda_load_module(image.read_bytes(), ["wangp_dense_nvfp4_strided_q"])["wangp_dense_nvfp4_strided_q"]
 
 
+# Split keys (precise mode, comparison switch): the query blocks of a launch's part-filled last wave run over ranges of the keys
+# (precise_split_sm120a.cubin), each range's normalized output and log2-sum-exp merged after (_merge_splits); the full waves before
+# them run as before. Only the tail's ranges take VRAM: a wave of CTAs' outputs (about 11 MB on an RTX 5090).
+SPLIT_KEYS = False
+SPLIT_RANGES = 8  # ranges of the keys of the last wave's blocks
+SPLIT_MIN_KEY_BLOCKS = 16  # 64-key blocks per range at least
+CTAS_PER_SM = 2  # the precise kernel's occupancy (128 threads, 32 KB of shared memory)
+
+
+@lru_cache(None)
+def _split_kernel(device):
+    with torch.cuda.device(device):
+        image = Path(__file__).with_name("cubins") / "precise_split_sm120a.cubin"
+        return torch.cuda._utils._cuda_load_module(image.read_bytes(), ["wangp_dense_precise_split"])["wangp_dense_precise_split"]
+
+
+@lru_cache(None)
+def _tail_split(device, blocks, heads, key_blocks):
+    """(query blocks run whole, ranges of keys of the blocks after them): the blocks of the last, part-filled wave of the GPU's CTA slots
+    split in SPLIT_RANGES (measured on an RTX 5090 at 220k tokens: 8 ranges 4 to 19 % faster for 1 to 4 heads, splitting earlier waves
+    too never faster)."""
+    slots = torch.cuda.get_device_properties(device).multi_processor_count * CTAS_PER_SM
+    main = blocks * heads // slots * slots // heads
+    splits = min(SPLIT_RANGES, key_blocks // SPLIT_MIN_KEY_BLOCKS)
+    return (main, splits) if main < blocks and splits > 1 else (blocks, 1)
+
+
+@triton.jit
+def _merge_splits(P, L, O, T, H, OST, OSH, S: tl.constexpr, BT: tl.constexpr):
+    """O[t, h] = sum_s 2^(L[s, h, t] - m) P[s, t, h] / sum_s 2^(L[s, h, t] - m), m = max_s L[s, h, t], in FP32."""
+    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    h = tl.program_id(1).to(tl.int64)
+    inside = t < T
+    t64 = t.to(tl.int64)
+    d = tl.arange(0, 128)
+    m = tl.full((BT,), float("-inf"), tl.float32)
+    for s in tl.static_range(S):
+        m = tl.maximum(m, tl.load(L + (s * H + h) * T + t64, inside, float("-inf")))
+    acc = tl.zeros((BT, 128), tl.float32)
+    den = tl.zeros((BT,), tl.float32)
+    for s in tl.static_range(S):
+        w = tl.exp2(tl.load(L + (s * H + h) * T + t64, inside, float("-inf")) - m)
+        w = tl.where(inside, w, 0.0)
+        acc += w[:, None] * tl.load(P + ((s * T + t64[:, None]) * H + h) * 128 + d[None, :], inside[:, None], 0).to(tl.float32)
+        den += w
+    out = tl.div_rn(acc, tl.where(inside, den, 1.0)[:, None])
+    tl.store(O + t64[:, None] * OST + h * OSH + d[None, :], out.to(O.dtype.element_ty), inside[:, None])
+
+
 @triton.jit
 def _read(X, W, ROPE, row, head, N, ST, SH, RT, RH, RP: tl.constexpr, RC: tl.constexpr, WH, EPS: tl.constexpr,
           PAIRS: tl.constexpr, INTERLEAVED: tl.constexpr, ROPE_FIRST: tl.constexpr, R: tl.constexpr):
@@ -233,9 +282,22 @@ def _staged_attention(out, packed, settings, mask, kernels=None, restore=None, s
             for first in range(0, full_blocks, per_launch):
                 kernels[-1]((min(full_blocks - first, per_launch), h, 1), (32, 4, 1),
                             [*full_args, first], shared_mem=shared_mem, stream=stream)
-        for first in range(full_blocks, blocks, per_launch):
+        main, splits = (_tail_split(q.device, blocks, h, triton.cdiv(n, 64)) if SPLIT_KEYS and settings.get("int8_scores", False) and not full_blocks
+                        and strided_query else (blocks, 1))
+        for first in range(full_blocks, main, per_launch):
             for kernel in kernels:
-                kernel((min(blocks - first, per_launch), h, 1), (32, 4, 1), [*args, first], shared_mem=shared_mem, stream=stream)
+                kernel((min(main - first, per_launch), h, 1), (32, 4, 1), [*args, first], shared_mem=shared_mem, stream=stream)
+        if splits > 1:
+            # the tail's ranges of keys into their own outputs and lse, then merged into out's tail rows (which may hold the tail's packed
+            # queries: written after)
+            rows, split_len = t - main * 128, triton.cdiv(triton.cdiv(n, 64), splits) * 64
+            parts = torch.empty((splits, rows, h, 128), device=q.device, dtype=out.dtype)
+            lse = torch.empty((splits, h, rows), device=q.device, dtype=torch.float32)
+            split_args = [q, k, v, parts, lse, qs, ks, vs, settings["mixed"], t, n, h, v.size(3), rows * h * 128, h * 128, 128, q.stride(2), q.stride(1),
+                          main, splits, split_len, main, rows]
+            _split_kernel(q.device)((blocks - main, h, splits), (32, 4, 1), split_args, shared_mem=shared_mem, stream=stream)
+            _merge_splits[(triton.cdiv(rows, 64), h)](parts, lse, out[:, main * 128:], rows, h, out.stride(1), out.stride(2), splits, 64, num_warps=4)
+            del parts, lse
     torch.autograd.graph.increment_version(out)
     if restore is not None:
         restore(out, settings)
